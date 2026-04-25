@@ -1,20 +1,13 @@
 """
-Gmail IMAP email reader.
-Connects to Gmail, searches for bank transaction emails, returns raw text.
-Uses only Python standard library — no extra packages needed.
+Gmail API email reader.
+Uses OAuth2 tokens (from session) to read emails — no passwords needed.
 """
-import imaplib  # IMAP protocol — to connect & search emails
-import email    # Parse raw email bytes into readable parts
-from email.header import decode_header
-import os
+import base64
 from datetime import datetime, timedelta
+from googleapiclient.discovery import build
+from google.oauth2.credentials import Credentials
 
-
-# Gmail IMAP server details (same for everyone)
-IMAP_HOST = "imap.gmail.com"
-IMAP_PORT = 993  # SSL port
-
-# Common bank sender keywords to filter emails
+# Same bank sender keywords as before
 BANK_SENDERS = [
     "alerts@", "noreply@", "transaction@", "notify@",
     "hdfcbank", "icicibank", "sbi", "axisbank", "kotak",
@@ -22,70 +15,73 @@ BANK_SENDERS = [
 ]
 
 
-def connect(email_addr: str, app_password: str):
-    """Login to Gmail via IMAP. Returns the connection object."""
-    conn = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
-    conn.login(email_addr, app_password)
-    return conn
+def _build_service(token_data: dict):
+    """Build Gmail API service from stored tokens."""
+    creds = Credentials(
+        token=token_data["token"],
+        refresh_token=token_data.get("refresh_token"),
+        token_uri=token_data["token_uri"],
+        client_id=token_data["client_id"],
+        client_secret=token_data["client_secret"],
+        scopes=token_data["scopes"],
+    )
+    return build("gmail", "v1", credentials=creds)
 
 
-def _get_email_text(msg):
-    """Extract plain text body from an email message."""
-    if msg.is_multipart():
-        for part in msg.walk():
-            if part.get_content_type() == "text/plain":
-                payload = part.get_payload(decode=True)
-                if payload:
-                    return payload.decode(errors="ignore")
-    else:
-        payload = msg.get_payload(decode=True)
-        if payload:
-            return payload.decode(errors="ignore")
+def _get_body(payload: dict) -> str:
+    """Extract plain text body from Gmail API message payload."""
+    if "parts" in payload:
+        for part in payload["parts"]:
+            if part["mimeType"] == "text/plain" and "data" in part.get("body", {}):
+                return base64.urlsafe_b64decode(part["body"]["data"]).decode(errors="ignore")
+            # Check nested parts
+            text = _get_body(part)
+            if text:
+                return text
+    elif "data" in payload.get("body", {}):
+        return base64.urlsafe_b64decode(payload["body"]["data"]).decode(errors="ignore")
     return ""
 
 
-def _decode_subject(msg):
-    """Decode email subject which may be encoded."""
-    subject = msg.get("Subject", "")
-    decoded_parts = decode_header(subject)
-    result = []
-    for part, charset in decoded_parts:
-        if isinstance(part, bytes):
-            result.append(part.decode(charset or "utf-8", errors="ignore"))
-        else:
-            result.append(part)
-    return " ".join(result)
-
-
-def fetch_emails(email_addr: str, app_password: str, days: int = 30):
+def fetch_emails(token_data: dict, days: int = 30) -> list[dict]:
     """
-    Fetch bank transaction emails from the last N days.
+    Fetch bank transaction emails using Gmail API.
     Returns list of dicts: {subject, sender, date, body}
     """
-    conn = connect(email_addr, app_password)
-    conn.select("INBOX")
+    service = _build_service(token_data)
 
-    # Search for emails from the last N days
-    since_date = (datetime.now() - timedelta(days=days)).strftime("%d-%b-%Y")
-    _, message_ids = conn.search(None, f'(SINCE "{since_date}")')
+    since = (datetime.now() - timedelta(days=days)).strftime("%Y/%m/%d")
+    query = f"after:{since}"
 
     results = []
-    for msg_id in message_ids[0].split():
-        _, msg_data = conn.fetch(msg_id, "(RFC822)")
-        raw = msg_data[0][1]
-        msg = email.message_from_bytes(raw)
+    page_token = None
 
-        sender = msg.get("From", "").lower()
-        # Only process emails that look like bank/payment alerts
-        if not any(kw in sender for kw in BANK_SENDERS):
-            continue
+    while True:
+        resp = service.users().messages().list(
+            userId="me", q=query, maxResults=100, pageToken=page_token
+        ).execute()
 
-        results.append({
-            "subject": _decode_subject(msg),
-            "sender": sender,
-            "date": msg.get("Date", ""),
-            "body": _get_email_text(msg),
-        })
+        for msg_meta in resp.get("messages", []):
+            msg = service.users().messages().get(
+                userId="me", id=msg_meta["id"], format="full"
+            ).execute()
 
-    conn.logout()
+            headers = {h["name"].lower(): h["value"] for h in msg["payload"].get("headers", [])}
+            sender = headers.get("from", "").lower()
+
+            # Only process bank/payment emails
+            if not any(kw in sender for kw in BANK_SENDERS):
+                continue
+
+            results.append({
+                "subject": headers.get("subject", ""),
+                "sender": sender,
+                "date": headers.get("date", ""),
+                "body": _get_body(msg["payload"]),
+            })
+
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
+
     return results

@@ -124,3 +124,12 @@ STATIC_URL = "static/"
 # https://docs.djangoproject.com/en/5.1/ref/settings/#default-auto-field
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
+
+# Session settings for OAuth2
+SESSION_COOKIE_SAMESITE = "Lax"
+SESSION_COOKIE_SECURE = False
+CSRF_COOKIE_SAMESITE = "Lax"
+SESSION_COOKIE_AGE = 86400 * 30  # 30 days
+
+# Allow OAuth over HTTP in development
+os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
