@@ -1,22 +1,20 @@
 """
-OAuth2 flow:
-1. User visits /auth/login/ → redirected to Google consent screen
-2. User clicks "Allow" → Google redirects to /auth/callback/
-3. We exchange the code for tokens → store in session
-4. Now we can call Gmail API with the access token
+OAuth2 flow for CONNECTING a specific Gmail account.
+User adds email first, then clicks "Connect" which triggers OAuth for that email.
 """
 import os
-import json
 from django.http import JsonResponse
 from django.shortcuts import redirect
 from google_auth_oauthlib.flow import Flow
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
+from .models import GmailAccount
 
 SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
 REDIRECT_URI = "http://localhost:8000/auth/callback/"
 
 
 def _get_flow():
-    """Build OAuth2 flow from .env credentials."""
     client_config = {
         "web": {
             "client_id": os.getenv("GOOGLE_CLIENT_ID"),
@@ -31,43 +29,58 @@ def _get_flow():
     return flow
 
 
-def auth_login(request):
-    """Redirect user to Google consent screen."""
+def auth_connect(request, account_id):
+    """Start OAuth for a specific Gmail account. Shows Google account picker with hint."""
+    if not request.user.is_authenticated:
+        return JsonResponse({"error": "Login first"}, status=401)
+
+    try:
+        account = request.user.gmail_accounts.get(id=account_id)
+    except GmailAccount.DoesNotExist:
+        return JsonResponse({"error": "Account not found"}, status=404)
+
     flow = _get_flow()
     auth_url, state = flow.authorization_url(
-        access_type="offline",  # gives us a refresh token
+        access_type="offline",
+        prompt="consent select_account",
+        login_hint=account.email,  # pre-select this email in Google picker
     )
     request.session["oauth_state"] = state
+    request.session["oauth_account_id"] = account.id
     return redirect(auth_url)
 
 
 def auth_callback(request):
-    """Google redirects here after user clicks Allow."""
+    """Google redirects here. Save tokens to the specific GmailAccount."""
+    if not request.user.is_authenticated:
+        return redirect("http://localhost:5173/")
+
+    account_id = request.session.pop("oauth_account_id", None)
+    if not account_id:
+        return redirect("http://localhost:5173/accounts")
+
     flow = _get_flow()
     flow.fetch_token(authorization_response=request.build_absolute_uri())
-
     credentials = flow.credentials
-    # Store tokens in session
-    request.session["google_tokens"] = {
-        "token": credentials.token,
-        "refresh_token": credentials.refresh_token,
-        "token_uri": credentials.token_uri,
-        "client_id": credentials.client_id,
-        "client_secret": credentials.client_secret,
-        "scopes": list(credentials.scopes),
-    }
 
-    # Redirect to frontend
-    return redirect("http://localhost:5173/")
+    # Verify the Gmail address matches
+    service = build("gmail", "v1", credentials=credentials)
+    profile = service.users().getProfile(userId="me").execute()
+    gmail_email = profile["emailAddress"].lower()
 
+    try:
+        account = request.user.gmail_accounts.get(id=account_id)
+    except GmailAccount.DoesNotExist:
+        return redirect("http://localhost:5173/accounts")
 
-def auth_status(request):
-    """Check if user is authenticated."""
-    is_authed = "google_tokens" in request.session
-    return JsonResponse({"authenticated": is_authed})
+    # Update with tokens — even if email doesn't match, save what they authorized
+    account.email = gmail_email
+    account.access_token = credentials.token
+    account.refresh_token = credentials.refresh_token or ""
+    account.client_id = credentials.client_id
+    account.client_secret = credentials.client_secret
+    account.scopes = ",".join(credentials.scopes)
+    account.connected = True
+    account.save()
 
-
-def auth_logout(request):
-    """Clear stored tokens."""
-    request.session.flush()
-    return JsonResponse({"status": "logged out"})
+    return redirect("http://localhost:5173/accounts")
