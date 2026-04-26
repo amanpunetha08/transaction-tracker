@@ -45,6 +45,10 @@ class Transaction(models.Model):
     merchant = models.CharField(max_length=200)
     date = models.DateField()
     email_subject = models.CharField(max_length=500, blank=True)
+    gmail_msg_id = models.CharField(max_length=100, blank=True, default="")
+    ref_number = models.CharField(max_length=100, blank=True, default="")
+    is_duplicate = models.BooleanField(default=False)
+    is_dismissed = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:

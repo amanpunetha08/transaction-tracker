@@ -22,7 +22,7 @@ def api_summary(request):
     account_id = request.GET.get("account")
     since = date.today() - timedelta(days=days)
 
-    qs = Transaction.objects.filter(user=request.user, date__gte=since)
+    qs = Transaction.objects.filter(user=request.user, date__gte=since, is_dismissed=False)
     if account_id:
         qs = qs.filter(gmail_account_id=account_id)
 
@@ -54,13 +54,13 @@ def api_transactions(request):
     account_id = request.GET.get("account")
     since = date.today() - timedelta(days=days)
 
-    qs = Transaction.objects.filter(user=request.user, date__gte=since)
+    qs = Transaction.objects.filter(user=request.user, date__gte=since, is_dismissed=False)
     if tx_type in ("debit", "credit"):
         qs = qs.filter(type=tx_type)
     if account_id:
         qs = qs.filter(gmail_account_id=account_id)
 
-    data = list(qs.values("id", "amount", "type", "merchant", "date", "gmail_account__email"))
+    data = list(qs.values("id", "amount", "type", "merchant", "date", "is_duplicate", "gmail_account__email"))
     for item in data:
         item["amount"] = float(item["amount"])
         item["date"] = item["date"].isoformat()
@@ -87,8 +87,8 @@ def api_sync(request):
     for account in accounts:
         try:
             emails = fetch_emails(account.to_token_dict(), days=days)
-            # Filter out already-imported emails before calling LLM
-            new_emails = [em for em in emails if not Transaction.objects.filter(user=request.user, email_subject=em["subject"]).exists()]
+            # Filter out already-imported emails by Gmail message ID
+            new_emails = [em for em in emails if not Transaction.objects.filter(user=request.user, gmail_msg_id=em["msg_id"]).exists()]
 
             # One LLM call for all new emails from this account
             parsed_list = parse_transactions_batch(new_emails)
@@ -97,16 +97,20 @@ def api_sync(request):
             for em, parsed in zip(new_emails, parsed_list):
                 if parsed is None:
                     continue
-                # Skip duplicate: same amount + type + date + merchant from same account
-                if Transaction.objects.filter(
-                    user=request.user,
-                    gmail_account=account,
-                    amount=parsed["amount"],
-                    type=parsed["type"],
-                    date=parsed["date"],
-                    merchant=parsed["merchant"],
-                ).exists():
-                    continue
+                # Dedup: same ref number = same transaction
+                # Fallback: no ref but same amount + type + date + merchant = likely duplicate
+                ref = parsed.get("ref", "")
+                if ref:
+                    is_dup = Transaction.objects.filter(user=request.user, ref_number=ref).exists()
+                else:
+                    is_dup = Transaction.objects.filter(
+                        user=request.user,
+                        amount=parsed["amount"],
+                        type=parsed["type"],
+                        date=parsed["date"],
+                        merchant=parsed["merchant"],
+                    ).exists()
+
                 Transaction.objects.create(
                     user=request.user,
                     gmail_account=account,
@@ -115,6 +119,9 @@ def api_sync(request):
                     merchant=parsed["merchant"],
                     date=parsed["date"],
                     email_subject=em["subject"],
+                    gmail_msg_id=em["msg_id"],
+                    ref_number=ref,
+                    is_duplicate=is_dup,
                 )
                 created += 1
 
@@ -129,3 +136,25 @@ def api_sync(request):
         "total_emails": total_emails,
         "accounts": results,
     })
+
+
+def api_dismiss(request, txn_id):
+    """Dismiss a duplicate transaction."""
+    err = _require_auth(request)
+    if err:
+        return err
+    updated = Transaction.objects.filter(user=request.user, id=txn_id).update(is_dismissed=True)
+    if not updated:
+        return JsonResponse({"error": "Transaction not found"}, status=404)
+    return JsonResponse({"status": "dismissed"})
+
+
+def api_keep(request, txn_id):
+    """Mark a flagged transaction as not duplicate."""
+    err = _require_auth(request)
+    if err:
+        return err
+    updated = Transaction.objects.filter(user=request.user, id=txn_id).update(is_duplicate=False)
+    if not updated:
+        return JsonResponse({"error": "Transaction not found"}, status=404)
+    return JsonResponse({"status": "kept"})

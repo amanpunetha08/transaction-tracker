@@ -15,5 +15,7 @@ urlpatterns = [
     # Data
     path("api/summary/", views.api_summary, name="api_summary"),
     path("api/transactions/", views.api_transactions, name="api_transactions"),
+    path("api/transactions/<int:txn_id>/dismiss/", views.api_dismiss, name="api_dismiss"),
+    path("api/transactions/<int:txn_id>/keep/", views.api_keep, name="api_keep"),
     path("api/sync/", views.api_sync, name="api_sync"),
 ]

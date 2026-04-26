@@ -28,6 +28,23 @@ BANK_QUERY = (
     "OR txn OR withdrawn OR purchase OR EMI OR autopay OR mandate OR bill)"
 )
 
+# Subjects that are NOT transactions — skip before sending to LLM
+SKIP_SUBJECTS = [
+    "login alert", "otp", "password", "verify", "welcome",
+    "registration success", "e-mandate set", "mandate registration",
+    "credit score", "credit limit", "loan offer", "pre-approved",
+    "reward", "cashback offer", "congratulations", "congrats",
+    "avail rs", "avail ₹", "price drop", "guide to",
+    "overdue", "reminder", "upcoming", "due date",
+    "newsletter", "unsubscribe",
+]
+
+
+def _is_skip_subject(subject: str) -> bool:
+    """Check if email subject indicates a non-transaction email."""
+    lower = subject.lower()
+    return any(skip in lower for skip in SKIP_SUBJECTS)
+
 
 def _build_service(token_data: dict):
     creds = Credentials(
@@ -109,8 +126,15 @@ def fetch_emails(token_data: dict, days: int = 30) -> list[dict]:
 
         body = _get_body(msg["payload"]) or msg.get("snippet", "")
 
+        subject = headers.get("subject", "")
+
+        # Skip non-transaction emails before sending to LLM
+        if _is_skip_subject(subject):
+            continue
+
         results.append({
-            "subject": headers.get("subject", ""),
+            "msg_id": msg_id,
+            "subject": subject,
             "sender": headers.get("from", ""),
             "date": headers.get("date", ""),
             "body": body,

@@ -12,13 +12,14 @@ SYSTEM_PROMPT = """You extract transaction details from Indian bank emails/SMS. 
 Return ONLY a JSON array, one object per email, in the same order. No other text.
 
 Each object format:
-{"amount": 1925.00, "type": "debit", "merchant": "Swiggy", "date": "2026-04-25"}
+{"amount": 1925.00, "type": "debit", "merchant": "Swiggy", "date": "2026-04-25", "ref": "122157890180"}
 
 Rules:
 - amount: number
 - type: "debit" or "credit"
 - merchant: the APP or PLATFORM or COMPANY through which payment was made
 - date: YYYY-MM-DD format
+- ref: UPI reference number, IMPS reference number, or NEFT reference number ONLY. Do NOT use payment gateway IDs (like pay_xxx, txn_xxx, order_xxx). Use "" if no bank reference number found.
 
 Merchant extraction rules (IMPORTANT):
 - If paid via Swiggy/Zomato/Amazon/Flipkart etc, merchant = the app name (e.g. "Swiggy" not the restaurant name)
@@ -32,7 +33,15 @@ Type rules:
 - "debited", "spent", "paid", "used for a transaction", "transferred" = debit
 - "credited", "received", "refund", "cashback", "salary" = credit
 
-If NOT a transaction (OTP, promo, alert without amount), return: {"skip": true}"""
+If NOT a transaction (OTP, promo, alert without amount), return: {"skip": true}
+
+These are NOT transactions — always skip:
+- Login alerts, OTP messages, password reset emails
+- E-mandate registration/setup confirmations (only mandate DEBIT is a transaction)
+- Promotional offers, loan offers, credit score updates
+- Bill reminders (only actual bill PAYMENT is a transaction)
+- Account statements, credit limit updates
+- Subscription confirmation/welcome emails (only the actual charge is a transaction)"""
 
 
 def parse_transactions_batch(emails: list[dict]) -> list[dict | None]:
@@ -55,15 +64,27 @@ def _parse_chunk(api_key: str, emails: list[dict]) -> list[dict | None]:
 
     try:
         client = Groq(api_key=api_key)
-        response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": batch_text},
-            ],
-            temperature=0,
-            max_tokens=2000,
-        )
+        try:
+            response = client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": batch_text},
+                ],
+                temperature=0,
+                max_tokens=2000,
+            )
+        except Exception:
+            # Fallback to 8B if 70B rate limited
+            response = client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": batch_text},
+                ],
+                temperature=0,
+                max_tokens=2000,
+            )
 
         raw = response.choices[0].message.content.strip()
         if raw.startswith("```"):
@@ -97,6 +118,7 @@ def _parse_chunk(api_key: str, emails: list[dict]) -> list[dict | None]:
                 "type": data.get("type", "debit"),
                 "merchant": data.get("merchant", "Unknown"),
                 "date": d,
+                "ref": data.get("ref", ""),
             })
 
         # Pad if LLM returned fewer results
@@ -104,7 +126,9 @@ def _parse_chunk(api_key: str, emails: list[dict]) -> list[dict | None]:
             parsed.append(None)
         return parsed
 
-    except Exception:
+    except Exception as e:
+        import logging
+        logging.error(f"LLM parse error: {e}")
         return [None] * len(emails)
 
 
