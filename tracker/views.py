@@ -3,7 +3,7 @@ from django.db.models import Sum
 from django.http import JsonResponse
 from .models import Transaction, GmailAccount
 from .email_reader import fetch_emails
-from .parser import parse_transaction
+from .parser import parse_transactions_batch
 
 
 def _require_auth(request):
@@ -87,12 +87,25 @@ def api_sync(request):
     for account in accounts:
         try:
             emails = fetch_emails(account.to_token_dict(), days=days)
+            # Filter out already-imported emails before calling LLM
+            new_emails = [em for em in emails if not Transaction.objects.filter(user=request.user, email_subject=em["subject"]).exists()]
+
+            # One LLM call for all new emails from this account
+            parsed_list = parse_transactions_batch(new_emails)
+
             created = 0
-            for em in emails:
-                if Transaction.objects.filter(user=request.user, email_subject=em["subject"]).exists():
-                    continue
-                parsed = parse_transaction(em["body"], em["date"])
+            for em, parsed in zip(new_emails, parsed_list):
                 if parsed is None:
+                    continue
+                # Skip duplicate: same amount + type + date + merchant from same account
+                if Transaction.objects.filter(
+                    user=request.user,
+                    gmail_account=account,
+                    amount=parsed["amount"],
+                    type=parsed["type"],
+                    date=parsed["date"],
+                    merchant=parsed["merchant"],
+                ).exists():
                     continue
                 Transaction.objects.create(
                     user=request.user,

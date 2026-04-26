@@ -10,10 +10,22 @@ from googleapiclient.discovery import build
 from google.oauth2.credentials import Credentials
 
 BANK_QUERY = (
-    "from:(alerts OR noreply OR transaction OR notify OR "
-    "hdfcbank OR icicibank OR sbi OR axisbank OR kotak OR "
-    "paytm OR phonepe OR gpay OR razorpay OR cred) "
-    "subject:(transaction OR debited OR credited OR payment OR spent OR received OR refund OR success OR declined)"
+    "from:("
+    # Major Private Banks
+    "hdfcbank OR icicibank OR axisbank OR kotak OR indusind OR yesbank OR idfcfirst OR "
+    "federalbank OR rblbank OR bandhanbank OR idbibank OR "
+    # Public Sector Banks
+    "sbi OR pnb OR bankofbaroda OR canarabank OR unionbank OR indianbank OR "
+    "bankofmaharashtra OR centralbank OR indianoverseas OR ucobank OR "
+    # Payment Apps & Wallets
+    "paytm OR phonepe OR gpay OR razorpay OR cred OR amazonpay OR "
+    "mobikwik OR freecharge OR simpl OR lazypay OR slice OR jupiter OR fi.money OR "
+    # Common sender patterns
+    "alerts OR noreply OR transaction OR notify OR donotreply"
+    ") "
+    "subject:(transaction OR debited OR credited OR payment OR spent OR received "
+    "OR refund OR success OR declined OR UPI OR transfer OR alert OR debit OR credit "
+    "OR txn OR withdrawn OR purchase OR EMI OR autopay OR mandate OR bill)"
 )
 
 

@@ -1,125 +1,114 @@
 """
-Transaction parser — tuned for real Indian bank email formats.
+Transaction parser using Groq LLM (Llama 3.3 70B).
+Batches ALL emails into a single API call to minimize usage.
 """
-import re
+import json
+import os
 from datetime import datetime
-from email.utils import parsedate_to_datetime
+from groq import Groq
 
-# --- Amount ---
-AMOUNT_RE = re.compile(r"(?:Rs\.?|INR|₹)\s*([\d,]+(?:\.\d{1,2})?)", re.IGNORECASE)
+SYSTEM_PROMPT = """You extract transaction details from Indian bank emails/SMS. You will receive multiple emails separated by "---EMAIL---". For each email, extract the transaction or mark it as skip.
 
-# --- Type ---
-DEBIT_KW = ["debited", "debit", "spent", "withdrawn", "purchase", "paid", "charged", "sent", "used for a transaction", "transferred", "completed", "successful", "payment of"]
-CREDIT_KW = ["credited", "credit", "received", "refund", "cashback", "deposited", "reversed", "salary"]
+Return ONLY a JSON array, one object per email, in the same order. No other text.
 
-# --- Merchant patterns (ordered by priority) ---
-MERCHANT_PATTERNS = [
-    # ICICI: "Info: AMAZON PAY IN E COMMERCE"
-    re.compile(r"Info[:\s]+([A-Za-z][\w .&/-]{2,50}?)(?:\s*[.\n]|$)", re.IGNORECASE),
-    # Kotak: "Sender Name: AMAN PUNETHA"
-    re.compile(r"Sender\s+Name[:\s]+([A-Za-z][\w .&/-]{2,50}?)(?:\s*\n|$)", re.IGNORECASE),
-    # SBI YONO: "Beneficiary Name aman"
-    re.compile(r"Beneficiary\s+Name\s+([A-Za-z][\w .&/-]{2,50}?)(?:\s+Beneficiary|\s*\n|$)", re.IGNORECASE),
-    # Kotak: "Remarks : Transfer to Family"
-    re.compile(r"Remarks?\s*[:\s]+([A-Za-z][\w .&/-]{2,50}?)(?:\s*\n|$)", re.IGNORECASE),
-    # "at Helen's Place" / "at Amazon.in"
-    re.compile(r"\bat\s+([A-Za-z][\w .&/'-]{2,40}?)(?:\s+(?:was|on|via|for|ref|using|dated)|[.\n]|$)", re.IGNORECASE),
-    # VPA: "to VPA merchant@bank"
-    re.compile(r"VPA\s+([A-Za-z][\w.-]+?)@", re.IGNORECASE),
-    # UPI: "UPI-Swiggy"
-    re.compile(r"UPI[-/]([A-Za-z][\w .&-]{1,30}?)(?:\s*[./]|\s+Ref|\s*$)", re.IGNORECASE),
-    # "Transferred to PHONEPE"
-    re.compile(r"(?:transferred|paid|sent)\s+to\s+([A-Z][\w .&-]{2,30}?)(?:\s*[.]|\s+(?:IMPS|NEFT|UPI|Ref|If|on)|\s*$)", re.IGNORECASE),
-    # "from ZERODHA EQUITY" (credits)
-    re.compile(r"(?:by|from)\s+(?:NEFT|IMPS|UPI)\s+(?:from\s+)?([A-Z][\w .&-]{2,30}?)(?:\s*[.]|\s*$)", re.IGNORECASE),
-    # "to MERCHANT. IMPS"
-    re.compile(r"\bto\s+([A-Z][\w .&-]{2,30}?)(?:\s*[.]|\s+(?:IMPS|NEFT|Ref|If))", re.IGNORECASE),
-]
+Each object format:
+{"amount": 1925.00, "type": "debit", "merchant": "Swiggy", "date": "2026-04-25"}
 
-# Skip these as merchant names
-SKIP_WORDS = {"your", "account", "a/c", "ac", "bank", "card", "otp", "cvv",
-              "anyone", "customer", "dear", "the", "this", "not", "you",
-              "be", "do", "never", "please", "click"}
+Rules:
+- amount: number
+- type: "debit" or "credit"
+- merchant: the APP or PLATFORM or COMPANY through which payment was made
+- date: YYYY-MM-DD format
 
-# --- Date patterns ---
-DATE_PATTERNS = [
-    (re.compile(r"(\w{3}\s+\d{1,2},?\s+\d{4})"), ["%b %d, %Y", "%b %d %Y"]),  # Apr 25, 2026
-    (re.compile(r"(\d{2}[-/]\d{2}[-/]\d{4})"), ["%d-%m-%Y", "%d/%m/%Y"]),       # 25-04-2026
-    (re.compile(r"(\d{2}-\w{3}-\d{2,4})"), ["%d-%b-%y", "%d-%b-%Y"]),           # 25-Apr-26
-    (re.compile(r"(\d{4}-\d{2}-\d{2})"), ["%Y-%m-%d"]),                          # 2026-04-25
-]
+Merchant extraction rules (IMPORTANT):
+- If paid via Swiggy/Zomato/Amazon/Flipkart etc, merchant = the app name (e.g. "Swiggy" not the restaurant name)
+- If paid via UPI to a person, merchant = person's name + "(UPI Transfer)"
+- If NEFT/IMPS to a person, merchant = person's name + "(Bank Transfer)"
+- If salary/refund credited, merchant = company name
+- For credit card transactions, use the "Info:" field as merchant
+- For bill payments (electricity, phone, etc), merchant = the biller name
 
-# --- Spam filter ---
-NON_TXN_RE = re.compile(r"(do not share|never share|otp.*password|one.time.password)", re.IGNORECASE)
+Type rules:
+- "debited", "spent", "paid", "used for a transaction", "transferred" = debit
+- "credited", "received", "refund", "cashback", "salary" = credit
+
+If NOT a transaction (OTP, promo, alert without amount), return: {"skip": true}"""
 
 
-def _parse_amount(text: str):
-    match = AMOUNT_RE.search(text)
-    return float(match.group(1).replace(",", "")) if match else None
+def parse_transactions_batch(emails: list[dict]) -> list[dict | None]:
+    """Parse multiple emails in batched LLM calls. Splits into chunks of 10."""
+    api_key = os.getenv("GROQ_API_KEY")
+    if not api_key or not emails:
+        return [None] * len(emails)
+
+    all_results = []
+    for i in range(0, len(emails), 10):
+        chunk = emails[i:i + 10]
+        all_results.extend(_parse_chunk(api_key, chunk))
+    return all_results
 
 
-def _parse_type(text: str) -> str:
-    lower = text.lower()
-    # Check multi-word phrases first (more specific)
-    if "used for a transaction" in lower or "transferred to" in lower:
-        return "debit"
-    # Then single keywords — check debit first since "credit card" contains "credit"
-    for kw in DEBIT_KW:
-        if kw in lower:
-            return "debit"
-    for kw in CREDIT_KW:
-        if kw in lower:
-            return "credit"
-    return "debit"
+def _parse_chunk(api_key: str, emails: list[dict]) -> list[dict | None]:
+    """Parse a chunk of up to 10 emails in one LLM call."""
+    parts = [em.get("body", "")[:800] for em in emails]
+    batch_text = "\n---EMAIL---\n".join(parts)
 
+    try:
+        client = Groq(api_key=api_key)
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": batch_text},
+            ],
+            temperature=0,
+            max_tokens=2000,
+        )
 
-def _parse_merchant(text: str) -> str:
-    for pattern in MERCHANT_PATTERNS:
-        match = pattern.search(text)
-        if match:
-            name = match.group(1).strip().rstrip(".")
-            first_word = name.lower().split()[0] if name else ""
-            if first_word in SKIP_WORDS:
+        raw = response.choices[0].message.content.strip()
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+
+        results_json = json.loads(raw)
+        if not isinstance(results_json, list):
+            results_json = [results_json]
+
+        parsed = []
+        for i, data in enumerate(results_json):
+            if data.get("skip"):
+                parsed.append(None)
                 continue
-            if len(name) >= 2:
-                return name
-    return "Unknown"
+
+            email_date = emails[i].get("date", "") if i < len(emails) else ""
+            try:
+                d = datetime.strptime(data["date"], "%Y-%m-%d").date()
+            except (ValueError, KeyError):
+                if email_date:
+                    from email.utils import parsedate_to_datetime
+                    try:
+                        d = parsedate_to_datetime(email_date).date()
+                    except Exception:
+                        d = datetime.now().date()
+                else:
+                    d = datetime.now().date()
+
+            parsed.append({
+                "amount": float(data.get("amount", 0)),
+                "type": data.get("type", "debit"),
+                "merchant": data.get("merchant", "Unknown"),
+                "date": d,
+            })
+
+        # Pad if LLM returned fewer results
+        while len(parsed) < len(emails):
+            parsed.append(None)
+        return parsed
+
+    except Exception:
+        return [None] * len(emails)
 
 
-def _parse_date(text: str, email_date: str = ""):
-    for regex, formats in DATE_PATTERNS:
-        match = regex.search(text)
-        if match:
-            date_str = match.group(1)
-            for fmt in formats:
-                try:
-                    return datetime.strptime(date_str, fmt).date()
-                except ValueError:
-                    continue
-    if email_date:
-        try:
-            return parsedate_to_datetime(email_date).date()
-        except Exception:
-            pass
-    return datetime.now().date()
-
-
+# Single email fallback (used by management command)
 def parse_transaction(body: str, email_date: str = ""):
-    """Parse bank email into transaction data. Returns None if not a real transaction."""
-    amount = _parse_amount(body)
-    if amount is None:
-        return None
-
-    # Skip if the amount only appears in "Available Limit" / "Credit Limit" context
-    # but not in a transaction context
-    lower = body.lower()
-    has_txn_keyword = any(kw in lower for kw in DEBIT_KW + CREDIT_KW)
-    if not has_txn_keyword:
-        return None
-
-    return {
-        "amount": amount,
-        "type": _parse_type(body),
-        "merchant": _parse_merchant(body),
-        "date": _parse_date(body, email_date),
-    }
+    results = parse_transactions_batch([{"body": body, "date": email_date}])
+    return results[0] if results else None
